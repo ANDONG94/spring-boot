@@ -1,0 +1,149 @@
+@Override
+    public Page<TaskCurrentResp> queryTaskPage(TaskQueryReq req, UserInfo userInfo) {
+
+
+        setTemplateCategoryId(req);
+        // 1.根据模板分类id查询出所有模板分类
+        List<String> treeIdList = templateCategoryService.getTemplateCategoryTreeIdList(req.getTemplateCategoryId());
+
+        //需要指定查询的任务idList
+        List<String> taskIdList = Collections.emptyList();
+        //从wf_todo_task_stash表查询暂存的任务id
+        if (req.getTaskStatus().equals(TaskStatusEnum.DRAFT.getStatus())) {
+            List<TodoTaskStash> todoTaskStashList = todoTaskStashService.list();
+            taskIdList = todoTaskStashList.stream().map(TodoTaskStash::getTaskId).collect(Collectors.toList());
+        }
+
+        if (!req.getTaskStatus().equals(TaskStatusEnum.ALL.getStatus())) {
+            //如果不是查询全部，说明需要查询指定状态的任务，这个时候如果taskIdList为空，说明不需要查询
+            if (CollectionUtils.isEmpty(taskIdList)) {
+                return new Page<>(req.getPage(), req.getPageSize());
+            }
+        }
+
+        // 2.根据templateCategoryTreeIdList查询出对应的flowManageList
+        List<FlowManage> flowManageList = flowManageService.lambdaQuery().in(FlowManage::getFlowType, treeIdList).list();
+        Map<String, String> flowManageMap = flowManageList.stream().collect(Collectors.toMap(FlowManage::getId, FlowManage::getFlowType));
+
+        if (CollectionUtils.isEmpty(flowManageList)) {
+            return new Page<>(req.getPage(), req.getPageSize());
+        }
+        List<String> flowManageIdList = flowManageList.stream().map(FlowManage::getId).collect(Collectors.toList());
+        //*************************************************临时处理代码块***********************************************//
+        List<FlowRunRelationship> list;
+        List<Task> taskList = new ArrayList<>();
+        LambdaQueryWrapper<FlowRunRelationship> wrapper = new LambdaQueryWrapper<>();
+        LocalDateTime now = LocalDateTime.now();
+        List<TaskCurrentResp> currentTaskList = new ArrayList<>();
+        Page<Task> taskPage;
+        if (StrUtil.isNotBlank(req.getKeyword())) {
+            wrapper.and(StringUtils.isNotEmpty(req.getKeyword()),
+                    wp -> wp.apply("(Position(lower({0}) in lower(flow_manage_name)) > 0)", req.getKeyword())
+                            .or()
+                            .apply("(Position({0} in cast(serial_number as text)) > 0)", req.getKeyword()));
+            list = flowRunRelationshipService.list(wrapper);
+            List<String> procInstanceIds = list.stream().map(FlowRunRelationship::getProcInstanceId).collect(Collectors.toList());
+
+            TaskQuery taskQuery = taskService.createTaskQuery();
+
+            procInstanceIds.stream().map(procInstanceId -> taskQuery.processInstanceId(procInstanceId).active().list())
+                    .collect(Collectors.toList()).forEach(taskList::addAll);
+            taskPage = ListUtil.listToPage(req.getPage(), req.getPageSize(), taskList);
+        } else {
+
+            // 3.查询任务
+            CurrentTaskInfo currentTaskInfo = queryTaskInfo(req, userInfo, taskIdList);
+            taskList = currentTaskInfo.getTaskList();
+            //临时优化方案
+            taskPage = ListUtil.listToPage(req.getPage(), req.getPageSize(), taskList);
+            taskList = taskPage.getRecords();
+
+            // 没有任务直接抛异常
+            if (CollectionUtils.isEmpty(taskList)) {
+                return new Page<>(req.getPage(), req.getPageSize());
+            }
+
+            // 根据任务list直接获取到实例id
+            List<String> instanceIdList = taskList.stream().map(Task::getProcessInstanceId).collect(Collectors.toList());
+            // 4.查询流程信息 -待优化
+
+            wrapper.in(FlowRunRelationship::getProcInstanceId, instanceIdList)
+                    .and(StringUtils.isNotEmpty(req.getKeyword()),
+                            wp -> wp.apply("(Position(lower({0}) in lower(flow_manage_name)) > 0)", req.getKeyword())
+                                    .or()
+                                    .apply("(Position({0} in cast(serial_number as text)) > 0) ", req.getKeyword()));
+            list = flowRunRelationshipService.list(wrapper);
+        }
+        //*************************************************临时处理代码块***********************************************//
+
+
+        // 5.查询当前任务是否为会签任务 --待优化
+        HashMap<String, Boolean> coSignInfoMap = getCoSignInfo(taskList);
+        // 6.遍历后找到部署列表中的数据
+        //6.1查询nodeInfo和节点表单formConfig
+        List<String> processDefIdList = taskList.stream().map(Task::getProcessDefinitionId).collect(Collectors.toList());
+        List<NodeInfo> nodeInfoList = wfNodeInfoService.lambdaQuery().in(NodeInfo::getProcDefId, processDefIdList).eq(NodeInfo::getNodeType, Constants.USER_TASK).list();
+        List<FormConfig> formConfigList = formConfigService.lambdaQuery().in(FormConfig::getProcDefId, processDefIdList).eq(FormConfig::getType, FormCodeEnum.FORM_TYPE_NODE.getCode()).list();
+
+        //获取candidateIdNameMap
+        HashMap<String, String> roleMap = getCandidateIdNameMapByType("role", nodeInfoList);
+        HashMap<String, String> postMap = getCandidateIdNameMapByType("post", nodeInfoList);
+        HashMap<String, String> userMap = getCandidateIdNameMapByType("user", nodeInfoList);
+        HashMap<String, String> candidateIdNameMap = new HashMap<>();
+        candidateIdNameMap.putAll(roleMap);
+        candidateIdNameMap.putAll(postMap);
+        candidateIdNameMap.putAll(userMap);
+        taskList.forEach(task -> {
+
+            Optional<FlowRunRelationship> first = list.stream().filter(flowRunRelationship ->
+                    StrUtil.isNotBlank(flowRunRelationship.getProcInstanceId()))
+                    .filter(flowRunRelationship -> flowRunRelationship.getProcInstanceId().equals(task.getProcessInstanceId())).findFirst();
+
+            if (first.isPresent()) {
+                FlowRunRelationship flowRunRelationship = first.get();
+                // 复制属性
+                TaskCurrentResp taskCurrentResp = BeanUtil.copy(flowRunRelationship, TaskCurrentResp.class);
+                if (flowManageIdList.contains(taskCurrentResp.getFlowManageId())) {
+                    // 补充开始时间
+                    LocalDateTime createTime = DateTimeUtil.toLocalDateTime(task.getCreateTime());
+                    taskCurrentResp.setStartTime(createTime);
+                    // 补充当前持续时间
+                    taskCurrentResp.setDueTime(DateTimeUtil.durationSeconds(createTime, now));
+                    // 当前环节
+                    taskCurrentResp.setNodeDesc(task.getName());
+                    taskCurrentResp.setId(task.getId());
+                    taskCurrentResp.setTaskId(task.getId());
+                    taskCurrentResp.setName(task.getName());
+                    taskCurrentResp.setDescription(task.getDescription());
+                    taskCurrentResp.setCategory(task.getCategory());
+                    taskCurrentResp.setTemplateCategory(templateCategoryService.getTemplateCategoryNameById(flowManageMap.get(taskCurrentResp.getFlowManageId())));
+                    taskCurrentResp.setIsCoSignTask(coSignInfoMap.get(task.getId()));
+                    //设置nodeInfo信息
+                    Optional<NodeInfo> firstNodeInfo = nodeInfoList.stream().filter(i -> i.getFlowManageId().equals(flowRunRelationship.getFlowManageId())).filter(i -> i.getNodeId().equals(task.getTaskDefinitionKey())).findFirst();
+                    if (firstNodeInfo.isPresent()) {
+                        NodeInfo nodeInfo = firstNodeInfo.get();
+                        setTaskCandidate(taskCurrentResp, nodeInfo, candidateIdNameMap);
+                        taskCurrentResp.setIsDraftNode(nodeInfo.getDraftNode());
+                    }
+                    //设置formConfig信息
+                    Optional<FormConfig> firstFormConfig = formConfigList.stream().filter(i -> i.getFlowManageId().equals(flowRunRelationship.getFlowManageId())).filter(i -> i.getNodeId().equals(task.getTaskDefinitionKey())).findFirst();
+                    if (firstFormConfig.isPresent()) {
+                        FormConfig formConfig = firstFormConfig.get();
+                        taskCurrentResp.setNodeFormUrl(formConfig.getUrl());
+                    }
+                    currentTaskList.add(taskCurrentResp);
+                }
+            }
+        });
+        Boolean getAllTask = req.getGetAllTask();
+        if (Objects.nonNull(getAllTask) && getAllTask) {
+            Page<TaskCurrentResp> taskCurrentRespPage = new Page<>();
+            taskCurrentRespPage.setRecords(currentTaskList);
+            return taskCurrentRespPage;
+        }
+        // 7.返回分页数据
+        //return ListUtil.listToPage(req.getPage(), req.getPageSize(), currentTaskList);
+        //临时优化方案
+        return new Page<TaskCurrentResp>(taskPage.getPages(), taskPage.getSize(), taskPage.getTotal()).setRecords(currentTaskList);
+    }
+
